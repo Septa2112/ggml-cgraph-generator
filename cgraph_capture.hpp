@@ -51,6 +51,14 @@ struct Capture {
     // stem) must turn this off or the first convolution is discarded.
     bool reset_on_im2col = true;
 
+    // Attention-mask VALUES, captured in eval_cb while the tensors are live. llama.cpp names
+    // the full-window and sliding-window masks identically and gives them the same shape when
+    // swa_full=true, so the artifact alone cannot tell them apart; dump_cgraph derives each
+    // mask's window from these values. Keyed by tensor pointer because ggml's arena reuses the
+    // freed fill-pass addresses for the final pass's tensors -- reading through saved pointers
+    // after llama_decode would see a recycled slot, so values must be copied DURING the pass.
+    std::map<const ggml_tensor*, std::vector<float>> mask_values;
+
     // Model init routinely runs its own graph passes before we get control back --
     // clip_init's flash-attention auto-probe (reserve_compute_meta) and, if requested, an
     // explicit warmup encode both drive the SAME cb_eval. Their tensors then get freed, and
@@ -64,6 +72,7 @@ struct Capture {
         weights.clear();
         weight_names.clear();
         leaves.clear();
+        mask_values.clear();
         counter = 0;
     }
 
@@ -163,6 +172,25 @@ inline bool eval_cb(ggml_tensor* t, bool ask, void* user_data) {
     if (cap->ids.count(t)) {
         return false;
     }
+    // Copy the attention-mask VALUES while the tensor is live (see mask_values): llama.cpp
+    // fills them before compute, and after llama_decode the arena may have recycled the
+    // address. The last sighting per tensor is the final pass, which is what classification
+    // wants.
+    if (t->op == GGML_OP_FLASH_ATTN_EXT && t->src[3] && t->src[3]->op == GGML_OP_NONE &&
+        !t->src[3]->view_src && (t->src[3]->flags & GGML_TENSOR_FLAG_INPUT) && t->src[3]->buffer) {
+        const ggml_tensor* m = t->src[3];
+        if (m->type == GGML_TYPE_F32 || m->type == GGML_TYPE_F16) {
+            std::vector<float> vals(static_cast<size_t>(m->ne[0]) * m->ne[1]);
+            if (m->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(m, vals.data(), 0, vals.size() * sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> h(vals.size());
+                ggml_backend_tensor_get(m, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+                for (size_t i = 0; i < vals.size(); i++) vals[i] = ggml_fp16_to_fp32(h[i]);
+            }
+            cap->mask_values[m] = std::move(vals);
+        }
+    }
     Node n;
     n.id = cap->intern(t);
     n.op = op_string(t);
@@ -235,20 +263,23 @@ struct RefInput {
     int64_t ne[4] = {1, 1, 1, 1};
     std::vector<uint8_t> data;
 };
-inline std::map<std::string, RefInput> g_ref_inputs;
+// Kept in capture order, deduped by TENSOR: the full and sliding-window masks share the ggml
+// name "attn_inp_kq_mask", so a name key would silently keep only one of them.
+inline std::vector<std::pair<std::string, RefInput>> g_ref_inputs;
+inline std::set<const ggml_tensor*> g_ref_inputs_seen;
 
 inline bool eval_cb_values(ggml_tensor* t, bool ask, void* user_data) {
     auto* cap = static_cast<Capture*>(user_data);
     if (ask) {
         for (int i = 0; i < GGML_MAX_SRC && t->src[i]; i++) {
             const ggml_tensor* s = t->src[i];
-            if ((s->flags & GGML_TENSOR_FLAG_INPUT) && s->buffer && !g_ref_inputs.count(ggml_get_name(s))) {
+            if ((s->flags & GGML_TENSOR_FLAG_INPUT) && s->buffer && g_ref_inputs_seen.insert(s).second) {
                 RefInput in;
                 in.type = static_cast<int32_t>(s->type);
                 for (int d = 0; d < 4; d++) in.ne[d] = s->ne[d];
                 in.data.resize(ggml_nbytes(s));
                 ggml_backend_tensor_get(s, in.data.data(), 0, in.data.size());
-                g_ref_inputs[ggml_get_name(s)] = std::move(in);
+                g_ref_inputs.emplace_back(ggml_get_name(s), std::move(in));
             }
         }
         eval_cb(t, true, user_data);
@@ -342,7 +373,8 @@ inline void json_escape(FILE* f, const std::string& s) {
 }
 
 inline void write_json(const Capture& cap, const std::string& path, const std::string& model,
-                const std::string& arch, int n_tokens, int n_kv) {
+                const std::string& arch, int n_tokens, int n_kv,
+                const std::map<std::string, int>& mask_windows = {}) {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) {
         fprintf(stderr, "cannot write %s\n", path.c_str());
@@ -356,6 +388,20 @@ inline void write_json(const Capture& cap, const std::string& path, const std::s
     // Shapes are baked in, so the artifact is only valid for this configuration. Record it so a
     // loader can refuse a mismatch rather than produce silent nonsense.
     fprintf(f, "  \"n_tokens\": %d,\n  \"n_kv\": %d,\n", n_tokens, n_kv);
+    // Sliding-window attention: which mask leaf is the windowed one and how wide its window is.
+    // Omitted entirely when no SWA mask is observable in this dump, so artifacts of full-window
+    // models are unchanged.
+    if (!mask_windows.empty()) {
+        fprintf(f, "  \"mask_roles\": {\n");
+        bool first = true;
+        for (const auto& [id, w] : mask_windows) {
+            fprintf(f, "%s    \"", first ? "" : ",\n");
+            json_escape(f, id);
+            fprintf(f, "\": {\"role\": \"kq_mask_swa\", \"window\": %d}", w);
+            first = false;
+        }
+        fprintf(f, "\n  },\n");
+    }
     fprintf(f, "  \"weights\": {\n");
     bool first = true;
     for (const auto& w : cap.weights) {
