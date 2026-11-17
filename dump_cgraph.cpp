@@ -136,6 +136,7 @@ int main(int argc, char** argv) {
     auto cp = llama_context_default_params();
     cp.n_ctx = n_kv;
     cp.n_batch = n_kv;
+    cp.n_ubatch = std::max<uint32_t>(cp.n_ubatch, n_tokens);
     // REF_OUT=<file>: also write llama.cpp's value of every node (see write_ref). Use NO_FILL=1 with it:
     // the captured decode is then the first token at position 0 of an empty cache, which a replay
     // can reproduce exactly.
