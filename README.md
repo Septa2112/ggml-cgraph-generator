@@ -223,16 +223,21 @@ different prompt length, context size, or image resolution needs a fresh dump at
 size, not a reshape of an existing one. This is a fundamental property of a ggml graph
 (shapes are concrete at construction time), not a limitation of this tool specifically.
 
-## Known bug
+## Backend note (formerly the "N_TOKENS >= 16" known bug)
 
-Dumping the plain decoder with `N_TOKENS >= 16` currently produces weight references
-in the output like `Vulkan0#blk.2.attn_norm.weight#0`, which don't correspond to any
-real tensor in the source `.gguf`. This happens because ggml's backend scheduler
-inserts a repacked-weight copy node once Vulkan becomes a candidate backend at larger
-batch sizes, and this tool's weight-vs-input classification (in `cgraph_capture.hpp`)
-currently misclassifies that copy as an ordinary `.gguf` weight leaf. `N_TOKENS` values
-of 1, 4, and 8 are unaffected and have been used extensively; treat 16+ as unreliable
-until this is fixed.
+Dumping the plain decoder with `N_TOKENS >= 16` used to produce weight references in
+the output like `Vulkan0#blk.2.attn_norm.weight#0`, which don't correspond to any real
+tensor in the source `.gguf`: ggml's backend scheduler offloads weight-bearing MUL_MATs
+to Vulkan once a batch is large enough (the MLP matmul's `ne[1] = 2*N_TOKENS` crosses
+Vulkan's offload threshold at 16) and inserts repacked-weight copy leaves, which the
+capture misclassified as `.gguf` weights.
+
+The dumper now **pins the model to the CPU device** (`llama_model_params.devices`) and
+disables op offloading (`cp.op_offload = false`), so the scheduler has no other backend
+to split to and no copy can be inserted -- any `N_TOKENS` is dumpable on any llama.cpp
+build, GPU-enabled or not. A post-dump guard fails loudly if a scheduler copy ever
+leaks into the artifact again. GPU-executed dumps are deliberately unsupported; the
+artifact is a topology snapshot and the CPU graph is the portable one.
 
 ## How it hooks into llama.cpp
 
