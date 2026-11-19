@@ -194,6 +194,17 @@ int main(int argc, char** argv) {
 
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;  // CPU: we want the topology, not performance
+    // Pin the model to the CPU device: at N_TOKENS >= 16 the scheduler would otherwise
+    // offload weight-bearing MUL_MATs to Vulkan (op_offload_min_batch_size = 32, and the MLP
+    // matmul has ne[1] = 2*N_TOKENS) and insert repacked-weight copy leaves whose "%s#%s#%d"
+    // names the capture misclassifies as .gguf weights. With only the CPU in the device list
+    // the scheduler has no other backend to split to.
+    static ggml_backend_dev_t cpu_devs[2] = {ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr};
+    if (cpu_devs[0] == nullptr) {
+        fprintf(stderr, "no CPU backend available\n");
+        return 2;
+    }
+    mp.devices = cpu_devs;
     llama_model* model = llama_model_load_from_file(path.c_str(), mp);
     if (!model) {
         fprintf(stderr, "failed to load %s\n", path.c_str());
@@ -210,6 +221,7 @@ int main(int argc, char** argv) {
     const bool no_fill = getenv("NO_FILL") != nullptr;
     cp.cb_eval = ref_out ? eval_cb_values : eval_cb;
     cp.cb_eval_user_data = &cap;
+    cp.op_offload = false;  // second layer of the CPU pin: never push CPU ops to a GPU
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;  // match the OV builder's topology
     // A quantized V cache requires flash attention, which is on for every decoder dump.
     cp.type_k = kv_type;
@@ -317,6 +329,19 @@ int main(int argc, char** argv) {
 
     char arch_buf[128] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+
+    // Belt and braces: the scheduler names cross-backend copies "%s#%s#%d"; the capture would
+    // misclassify them as .gguf weight leaves. The CPU pin makes them impossible -- fail loudly
+    // if one ever appears again instead of writing a broken artifact.
+    for (const auto& [id, name] : cap.weight_names) {
+        if (name.find('#') != std::string::npos) {
+            fprintf(stderr,
+                    "decorated weight leaf '%s' (id %s): a scheduler copy was misclassified as a "
+                    "weight -- the dump was not CPU-pinned\n",
+                    name.c_str(), id.c_str());
+            return 7;
+        }
+    }
 
     if (token_embd_only && !keep_token_embd(cap)) {
         fprintf(stderr, "no GET_ROWS(token_embd.weight, ...) in the graph\n");
