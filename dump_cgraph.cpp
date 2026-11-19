@@ -20,6 +20,7 @@
 // concrete (n_tokens, n_kv), which is baked into every node's dimensions. That is the central
 // trade of this approach versus OpenVINO's own builder.
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,69 @@
 using namespace cgraph;
 
 namespace {
+
+// Sliding-window attention: llama.cpp fills the full-window and sliding-window masks through
+// two input tensors that share the ggml name "attn_inp_kq_mask" and (with swa_full=true) the
+// same shape, so the topology alone cannot tell them apart. Read their FILLED values from the
+// final decode instead: a STANDARD-window mask shows exactly min(position+1, window) visible
+// cells per row, so the deepest row's trailing finite run is the window. The result marks each
+// SWA mask leaf for the artifact's "mask_roles" field; anything that cannot be classified
+// confidently is left unmarked (the loader then treats it as a full-causal mask, as before).
+std::map<std::string, int> classify_swa_masks(const Capture& cap, llama_model* model,
+                                              const std::string& arch, int n_kv, bool filled) {
+    std::map<std::string, int> out;  // leaf id -> window
+    if (!filled) return out;         // position-0 dump: the window is not observable
+    for (const auto& [t, vals] : cap.mask_values) {
+        if (t->ne[0] < n_kv || t->ne[1] < 1) {
+            continue;
+        }
+        const int64_t rows = t->ne[1];
+        // The deepest row sits at position n_kv-1 (the fill decode runs n_kv-n_tokens BOS
+        // tokens first); its trailing finite run is the window.
+        const float* last = vals.data() + (rows - 1) * n_kv;
+        int64_t window = 0;
+        for (int64_t c = n_kv - 1; c >= 0 && std::isfinite(last[c]); c--) window++;
+        if (window <= 0 || window >= n_kv) continue;  // full-causal in this dump
+        // STANDARD-window consistency: row at position p shows exactly min(p+1, window)
+        // visible cells ENDING AT p -- columns past p belong to later rows of this batch and
+        // are -inf, so the run must be measured from p, not from the end of the row.
+        // A chunked or symmetric window breaks the identity; leave such masks unmarked.
+        bool standard = true;
+        for (int64_t r = 0; r < rows && standard; r++) {
+            const int64_t p = static_cast<int64_t>(n_kv) - rows + r;  // rows are consecutive
+            const int64_t expected = std::min<int64_t>(p + 1, window);
+            const float* row = vals.data() + r * n_kv;
+            int64_t s = 0;
+            for (int64_t c = p; c >= 0 && std::isfinite(row[c]); c--) s++;
+            standard = s == expected;
+        }
+        if (!standard) {
+            fprintf(stderr, "swa: mask '%s' is windowed but not a STANDARD window; left unmarked (rows",
+                    ggml_get_name(t));
+            for (int64_t r = 0; r < rows; r++) {
+                const int64_t p = static_cast<int64_t>(n_kv) - rows + r;
+                const float* row = vals.data() + r * n_kv;
+                int64_t s = 0;
+                for (int64_t c = p; c >= 0 && std::isfinite(row[c]); c--) s++;
+                fprintf(stderr, " %lld:%lld", static_cast<long long>(p), static_cast<long long>(s));
+            }
+            fprintf(stderr, ")\n");
+            continue;
+        }
+        // The window must agree with the GGUF's sliding window when the file records one.
+        char buf[64] = {0};
+        llama_model_meta_val_str(model, (arch + ".attention.sliding_window").c_str(), buf, sizeof(buf));
+        if (buf[0] && atoi(buf) != static_cast<int>(window)) {
+            fprintf(stderr,
+                    "swa: mask '%s' window %lld disagrees with GGUF sliding_window %s; left unmarked\n",
+                    ggml_get_name(t), static_cast<long long>(window), buf);
+            continue;
+        }
+        const auto id = cap.ids.find(t);
+        if (id != cap.ids.end()) out[id->second] = static_cast<int>(window);
+    }
+    return out;
+}
 
 // Keep only the token embedding lookup and the leaves it reads (DUMP_TOKEN_EMBD).
 bool keep_token_embd(Capture& cap) {
@@ -258,7 +322,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "no GET_ROWS(token_embd.weight, ...) in the graph\n");
         return 5;
     }
-    write_json(cap, out, path, arch_buf, n_tokens, n_kv);
+    // Same condition as the fill decode above: without it the deepest row is position 0 and the
+    // sliding window cannot be observed.
+    const bool filled = !embd_mode && !token_embd_only && !no_fill && n_kv > n_tokens;
+    const auto mask_windows = classify_swa_masks(cap, model, arch_buf, n_kv, filled);
+    write_json(cap, out, path, arch_buf, n_tokens, n_kv, mask_windows);
     if (ref_out) {
         write_ref(cap, ref_out);
         write_ref_inputs(std::string(ref_out) + ".inputs");
@@ -287,6 +355,9 @@ int main(int argc, char** argv) {
     printf("op types     : %zu\n", hist.size());
     for (const auto& h : hist) {
         printf("  %-28s %4d\n", h.first.c_str(), h.second);
+    }
+    for (const auto& [id, w] : mask_windows) {
+        printf("swa mask     : %s (window %d)\n", id.c_str(), w);
     }
     printf("wrote %s\n", out.c_str());
 
